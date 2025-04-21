@@ -1,7 +1,218 @@
 <!DOCTYPE html>
 <html>
+<head>
+    <title>Spotify Web Playback to n8n Webhook</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
+</head>
 <body>
-<h1>Hello World</h1>
-<p>I'm hosted with GitHub Pages.</p>
+    <h1>Spotify Web Playback to n8n Webhook</h1>
+    <div id="player-status">État: Déconnecté</div>
+    <div id="current-track">Piste: Aucune</div>
+    <div id="webhook-status">Webhook: Non configuré</div>
+    <button id="connect">Connecter à Spotify</button>
+    <hr>
+    <div>
+        <h3>Configuration du Webhook</h3>
+        <label for="webhook-url">URL du Webhook n8n:</label>
+        <input type="text" id="webhook-url" placeholder="https://votre-instance-n8n.com/webhook/spotify-events" style="width: 400px;">
+        <button id="save-webhook">Enregistrer</button>
+    </div>
+
+    <script>
+        // Configuration Spotify
+        const clientId = 'a3d39292b502408e89e2f0ec314cabbf'; // À remplacer par votre Client ID Spotify
+        const redirectUri = window.location.origin + window.location.pathname;
+        
+        // Variables pour stocker l'état
+        let player;
+        let webhookUrl = localStorage.getItem('webhookUrl') || '';
+        let deviceId;
+        let currentTrackId = null;
+        let playerState = null;
+        
+        // Initialiser l'interface
+        $(document).ready(() => {
+            // Restaurer l'URL du webhook si sauvegardée
+            if (webhookUrl) {
+                $('#webhook-url').val(webhookUrl);
+                $('#webhook-status').text('Webhook: Configuré - ' + webhookUrl);
+            }
+            
+            // Gérer le bouton de sauvegarde webhook
+            $('#save-webhook').click(() => {
+                webhookUrl = $('#webhook-url').val().trim();
+                localStorage.setItem('webhookUrl', webhookUrl);
+                $('#webhook-status').text('Webhook: Configuré - ' + webhookUrl);
+                console.log('Webhook URL sauvegardée:', webhookUrl);
+            });
+            
+            // Gérer la connexion Spotify
+            $('#connect').click(() => {
+                connectToSpotify();
+            });
+            
+            // Vérifier si nous revenons d'une authentification Spotify
+            const params = new URLSearchParams(window.location.hash.substring(1));
+            const accessToken = params.get('access_token');
+            
+            if (accessToken) {
+                // Sauvegarder le token et initialiser le lecteur
+                localStorage.setItem('spotify_token', accessToken);
+                initializePlayer(accessToken);
+                $('#connect').text('Reconnexion à Spotify');
+            }
+        });
+        
+        // Fonction pour se connecter à Spotify
+        function connectToSpotify() {
+            const scopes = 'streaming user-read-email user-read-private user-read-playback-state user-modify-playback-state';
+            const authUrl = 'https://accounts.spotify.com/authorize' +
+                '?client_id=' + clientId +
+                '&response_type=token' +
+                '&redirect_uri=' + encodeURIComponent(redirectUri) +
+                '&scope=' + encodeURIComponent(scopes);
+            
+            window.location = authUrl;
+        }
+        
+        // Initialiser le lecteur Spotify
+        function initializePlayer(token) {
+            const script = document.createElement('script');
+            script.src = 'https://sdk.scdn.co/spotify-player.js';
+            script.async = true;
+            document.body.appendChild(script);
+            
+            window.onSpotifyWebPlaybackSDKReady = () => {
+                player = new Spotify.Player({
+                    name: 'n8n Webhook Trigger',
+                    getOAuthToken: cb => { cb(token); },
+                    volume: 0.5
+                });
+                
+                // Événements du lecteur
+                player.addListener('ready', ({ device_id }) => {
+                    console.log('Lecteur prêt avec Device ID:', device_id);
+                    deviceId = device_id;
+                    $('#player-status').text('État: Connecté (Device ID: ' + device_id + ')');
+                    
+                    // Commencer à vérifier l'état du lecteur
+                    setInterval(checkPlaybackState, 1000);
+                });
+                
+                player.addListener('not_ready', ({ device_id }) => {
+                    console.log('Le lecteur n\'est plus prêt:', device_id);
+                    $('#player-status').text('État: Non prêt');
+                });
+                
+                player.addListener('player_state_changed', (state) => {
+                    if (!state) return;
+                    
+                    const previousState = playerState;
+                    playerState = {
+                        paused: state.paused,
+                        position: state.position,
+                        track: state.track_window.current_track?.id || 'unknown'
+                    };
+                    
+                    // Vérifier les changements
+                    if (!previousState || previousState.track !== playerState.track) {
+                        const trackInfo = state.track_window.current_track;
+                        $('#current-track').text('Piste: ' + trackInfo.name + ' - ' + trackInfo.artists[0].name);
+                        
+                        // Envoyer un webhook pour changement de piste
+                        sendWebhook({
+                            event: 'track_changed',
+                            track: {
+                                id: trackInfo.id,
+                                name: trackInfo.name,
+                                artist: trackInfo.artists[0].name,
+                                album: trackInfo.album.name,
+                                duration: trackInfo.duration_ms
+                            }
+                        });
+                    }
+                    
+                    if (!previousState || previousState.paused !== playerState.paused) {
+                        // Envoyer un webhook pour changement d'état (lecture/pause)
+                        sendWebhook({
+                            event: 'playback_state_changed',
+                            state: playerState.paused ? 'paused' : 'playing',
+                            position: playerState.position
+                        });
+                    }
+                });
+                
+                // Connecter le lecteur
+                player.connect().then(success => {
+                    if (success) {
+                        console.log('Lecteur Spotify connecté avec succès!');
+                    } else {
+                        console.log('Échec de la connexion du lecteur');
+                        $('#player-status').text('État: Échec de connexion');
+                    }
+                });
+            };
+        }
+        
+        // Vérifier l'état du lecteur périodiquement (sécurité si les événements manquent)
+        async function checkPlaybackState() {
+            if (!webhookUrl || !deviceId) return;
+            
+            try {
+                const token = localStorage.getItem('spotify_token');
+                const response = await fetch('https://api.spotify.com/v1/me/player', {
+                    headers: {
+                        'Authorization': 'Bearer ' + token
+                    }
+                });
+                
+                if (response.status === 200) {
+                    const data = await response.json();
+                    
+                    if (data.item && data.item.id !== currentTrackId) {
+                        currentTrackId = data.item.id;
+                        $('#current-track').text('Piste: ' + data.item.name + ' - ' + data.item.artists[0].name);
+                        
+                        // Envoyer webhook pour changement de piste (détecté par API)
+                        sendWebhook({
+                            event: 'track_changed_api',
+                            track: {
+                                id: data.item.id,
+                                name: data.item.name,
+                                artist: data.item.artists[0].name,
+                                album: data.item.album.name,
+                                duration: data.item.duration_ms
+                            },
+                            is_playing: data.is_playing
+                        });
+                    }
+                }
+            } catch (error) {
+                console.error('Erreur lors de la vérification de l\'état du lecteur:', error);
+            }
+        }
+        
+        // Envoyer un webhook à n8n
+        function sendWebhook(data) {
+            if (!webhookUrl) {
+                console.log('Webhook non configuré, impossible d\'envoyer:', data);
+                return;
+            }
+            
+            fetch(webhookUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(data)
+            })
+            .then(response => {
+                console.log('Webhook envoyé avec succès:', response.status);
+            })
+            .catch(error => {
+                console.error('Erreur lors de l\'envoi du webhook:', error);
+            });
+        }
+    </script>
 </body>
 </html>
